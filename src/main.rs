@@ -1,7 +1,9 @@
-use std::fs;
+use std::{fs, thread, time};
 use rand::Rng;
 use std::time::{Duration, Instant};
 use image::{GrayImage, Luma};
+use std::sync::{Arc, Mutex};
+use once_cell::sync::Lazy;
 
 const INPUT_FEATURES: usize = 28 * 28; // 28x28 images
 const HIDDEN_LAYER_COUNT: usize = 1; // [ADJUSTABLE] total amount of hidden layers
@@ -11,10 +13,16 @@ const EPOCHS: usize = 2; // [ADJUSTABLE] how many times the model is trained on 
 const LEARNING_RATE: f64 = 0.01; // [ADJUSTABLE] Learning rate of the model
 const BATCH_SIZE: usize = 10; // batch size for training
 
+static NUM_CPUS: Lazy<usize> = Lazy::new(|| {
+	num_cpus::get()
+});
+
 fn main() {
 	if HIDDEN_LAYER_COUNT == 0 {
 		panic!("There must be at least one hidden layer!");
 	}
+
+	&*NUM_CPUS; // read lazy variable to initialize it
 
 	let mut model: Vec<Vec<Vec<f64>>> = vec![new_matrix(INPUT_FEATURES+1, HIDDEN_LAYER_SIZE, "random uniform")];
 	if HIDDEN_LAYER_COUNT > 1 {
@@ -231,20 +239,44 @@ fn matrix_multiply(mat_a: &Vec<Vec<f64>>, mat_b: &Vec<Vec<f64>>) -> Vec<Vec<f64>
 		);
 	}
 
-	let mut prod = new_matrix(ra, cb, "zero");
+	// redefine matrices for use with parallelization
+	let mat_a_arc = Arc::new(mat_a.clone());
+	let mat_b_arc = Arc::new(mat_b.clone());
 
-	for i in 0..ra {
-		// row iterator
-		for j in 0..cb {
-			// col iterator
-			for k in 0..ca {
-				// cross product iterator
-				prod[i][j] += mat_a[i][k] * mat_b[k][j]
+	let cpu_count = Lazy::get(&NUM_CPUS).unwrap();
+	let thread_count = if cpu_count > &ra { ra } else { *cpu_count };
+	let prod: Arc<Mutex<Vec<Vec<Vec<f64>>>>> = Arc::new(Mutex::new(vec![Vec::new(); thread_count]));
+	let mut handles = Vec::new();
+
+	for i in 0..thread_count {
+		let mat_a1 = Arc::clone(&mat_a_arc);
+		let mat_b1 = Arc::clone(&mat_b_arc);
+		let prod = Arc::clone(&prod);
+		let start_row = ((ra as f64) / (thread_count as f64) * (i as f64)).floor() as usize;
+		let end_row = ((ra as f64) / (thread_count as f64) * ((i+1) as f64)).floor() as usize;
+		let handle = thread::spawn(move || {
+			let mut partial_prod = new_matrix(end_row - start_row, cb, "zero");
+			// row iterator
+			for j in start_row..end_row {
+				// col iterator
+				for k in 0..cb {
+					// cross product iterator
+					for l in 0..ca {
+						partial_prod[j - start_row][k] += mat_a1[j][l] * mat_b1[l][k]
+					}
+				}
 			}
-		}
+			prod.lock().unwrap()[i] = partial_prod;
+		});
+
+		handles.push(handle);
 	}
 
-	prod
+	for handle in handles {
+		handle.join().unwrap();
+	}
+
+	prod.lock().unwrap().concat()
 }
 
 fn matrix_scalar_mult(scalar: &f64, mat: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {
@@ -333,15 +365,13 @@ fn new_one_hot_label(position: usize, total_size: usize) -> Vec<f64> {
 }
 
 fn model_forward_pass(model: &Vec<Vec<Vec<f64>>>, input_sample: &Vec<Vec<f64>>) -> Vec<Vec<Vec<f64>>> {
-	let mut running_matrix = input_sample.to_owned();
 	let mut intermediate_steps = vec![input_sample.to_owned(); model.len()+1];
 	for i in 0..model.len() {
 		// doing this operation: s(R*W)
 		// where s is the element-wise sigmoid, R is the output from the previous layer, and W is layer-to-layer weights
-		running_matrix = sigmoid_of_matrix(
-			&matrix_multiply(&running_matrix, &model[i]),
+		intermediate_steps[i+1] = sigmoid_of_matrix(
+			&matrix_multiply(&intermediate_steps[i], &model[i]),
 		);
-		intermediate_steps[i+1] = running_matrix.clone();
 	}
 	// perform softmax on the last step to get probabilities
 	intermediate_steps.push(softmax_of_matrix(&intermediate_steps[intermediate_steps.len()-1]));
