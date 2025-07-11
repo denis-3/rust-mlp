@@ -1,6 +1,6 @@
-use std::{fs, thread, time};
+use std::{fs, thread};
 use rand::Rng;
-use std::time::{Duration, Instant};
+use std::time::{Instant};
 use image::{GrayImage, Luma};
 use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
@@ -22,7 +22,7 @@ fn main() {
 		panic!("There must be at least one hidden layer!");
 	}
 
-	&*NUM_CPUS; // read lazy variable to initialize it
+	let _ = &*NUM_CPUS; // read lazy variable to initialize it
 
 	let mut model: Vec<Vec<Vec<f64>>> = vec![new_matrix(INPUT_FEATURES+1, HIDDEN_LAYER_SIZE, "random uniform")];
 	if HIDDEN_LAYER_COUNT > 1 {
@@ -39,9 +39,9 @@ fn main() {
 	let mut train_lbls = load_mnist_labels_file("./data/train-labels-idx1-ubyte");
 
 	println!("Loading testing images...");
-	let mut test_imgs = load_mnist_images_file("./data/t10k-images-idx3-ubyte");
+	let test_imgs = load_mnist_images_file("./data/t10k-images-idx3-ubyte");
 	println!("Loading testing labels...");
-	let mut test_lbls = load_mnist_labels_file("./data/t10k-labels-idx1-ubyte");
+	let test_lbls = load_mnist_labels_file("./data/t10k-labels-idx1-ubyte");
 
 	println!("Data stats:\nTraining images: {}\nTraining labels: {}\nTesting images: {}\nTesting labels: {}", train_imgs.len(), train_lbls.len(), test_imgs.len(), test_lbls.len());
 
@@ -104,7 +104,6 @@ fn main() {
 					best_guess_i = j;
 				}
 			}
-			// println!("{} ---- {:?}", best_guess_i, softmax);
 
 			if best_guess_i == test_lbls[i] as usize {
 				correct_count += 1;
@@ -215,15 +214,41 @@ fn matrix_subtract(mat_a: &Vec<Vec<f64>>, mat_b: &Vec<Vec<f64>>) -> Vec<Vec<f64>
 		);
 	}
 
-	let mut result = new_matrix(ra, ca, "zero");
+	// define Arc matrices Arc for use with parallelization
+	let mat_a_arc = Arc::new(mat_a.clone());
+	let mat_b_arc = Arc::new(mat_b.clone());
 
-	for i in 0..ra {
-		for j in 0..ca {
-			result[i][j] = mat_a[i][j] - mat_b[i][j];
-		}
+	let cpu_count = Lazy::get(&NUM_CPUS).unwrap();
+	let thread_count = if cpu_count > &ra { ra } else { *cpu_count };
+	let result: Arc<Mutex<Vec<Vec<Vec<f64>>>>> = Arc::new(Mutex::new(vec![Vec::new(); thread_count]));
+	let mut handles = Vec::new();
+
+	for i in 0..thread_count {
+		let mat_a1 = Arc::clone(&mat_a_arc);
+		let mat_b1 = Arc::clone(&mat_b_arc);
+		let result = Arc::clone(&result);
+		let start_row = ((ra as f64) / (thread_count as f64) * (i as f64)).floor() as usize;
+		let end_row = ((ra as f64) / (thread_count as f64) * ((i+1) as f64)).floor() as usize;
+		let handle = thread::spawn(move || {
+			let mut partial_result = new_matrix(end_row - start_row, cb, "zero");
+			// row iterator
+			for j in start_row..end_row {
+				// col iterator
+				for k in 0..ca {
+					partial_result[j - start_row][k] = mat_a1[j][k] - mat_b1[j][k];
+				}
+			}
+			result.lock().unwrap()[i] = partial_result;
+		});
+
+		handles.push(handle);
 	}
 
-	result
+	for handle in handles {
+		handle.join().unwrap();
+	}
+
+	result.lock().unwrap().concat()
 }
 
 fn matrix_multiply(mat_a: &Vec<Vec<f64>>, mat_b: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {
@@ -239,7 +264,7 @@ fn matrix_multiply(mat_a: &Vec<Vec<f64>>, mat_b: &Vec<Vec<f64>>) -> Vec<Vec<f64>
 		);
 	}
 
-	// redefine matrices for use with parallelization
+	// define Arc matrices for use with parallelization
 	let mat_a_arc = Arc::new(mat_a.clone());
 	let mat_b_arc = Arc::new(mat_b.clone());
 
@@ -300,7 +325,7 @@ fn matrix_hadamard(mat_a: &Vec<Vec<f64>>, mat_b: &Vec<Vec<f64>>) -> Vec<Vec<f64>
 	if ra != rb || ca != cb {
 		panic!(
 			"Matrix sizes are incompatible for Hadamard product: {}x{} and {}x{}",
-		 ra, ca, rb, cb
+			ra, ca, rb, cb
 		);
 	}
 
@@ -316,13 +341,49 @@ fn matrix_hadamard(mat_a: &Vec<Vec<f64>>, mat_b: &Vec<Vec<f64>>) -> Vec<Vec<f64>
 }
 // sigmoid (or logistic) function element-wise on a matrix
 fn sigmoid_of_matrix(matrix: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {
-	let mut result = new_matrix(matrix.len(), matrix[0].len(), "zero");
-	for i in 0..(matrix.len()) {
-		for j in 0..(matrix[0].len()) {
-			result[i][j] = 1. / (1. + std::f64::consts::E.powf(-matrix[i][j]));
-		}
+	// define Arc matrix for use with parallelization
+	let r = matrix.len();
+	let c = matrix[0].len();
+	let mat_arc = Arc::new(matrix.clone());
+
+	let cpu_count = Lazy::get(&NUM_CPUS).unwrap();
+	let thread_count = if cpu_count > &r { r } else { *cpu_count };
+	let result: Arc<Mutex<Vec<Vec<f64>>>> = Arc::new(Mutex::new(new_matrix(matrix.len(), matrix[0].len(), "zero")));
+	let mut handles = Vec::new();
+
+	for i in 0..thread_count {
+		let mat1 = Arc::clone(&mat_arc);
+		let result = Arc::clone(&result);
+		let start_row = ((r as f64) / (thread_count as f64) * (i as f64)).floor() as usize;
+		let end_row = ((r as f64) / (thread_count as f64) * ((i+1) as f64)).floor() as usize;
+		let handle = thread::spawn(move || {
+			let mut partial_result = new_matrix(end_row - start_row, c, "zero");
+			// calculate results first
+			// row iterator
+			for j in start_row..end_row {
+				// col iterator
+				for k in 0..c {
+					partial_result[j - start_row][k] = 1. / (1. + std::f64::consts::E.powf(-mat1[j][k]));
+				}
+			}
+
+			// transfer results
+			let mut result_locked = result.lock().unwrap();
+			for j in start_row..end_row {
+				for k in 0..c {
+					result_locked[j][k] = partial_result[j - start_row][k]
+				}
+			}
+		});
+
+		handles.push(handle);
 	}
-	result
+
+	for handle in handles {
+		handle.join().unwrap();
+	}
+
+	result.lock().unwrap().to_vec()
 }
 
 // derivative of sigmoid
