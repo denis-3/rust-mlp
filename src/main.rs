@@ -9,9 +9,10 @@ const INPUT_FEATURES: usize = 28 * 28; // 28x28 images
 const HIDDEN_LAYER_COUNT: usize = 1; // [ADJUSTABLE] total amount of hidden layers
 const HIDDEN_LAYER_SIZE: usize = 200; // [ADJUSTABLE] perceptrons per each hidden layer
 const OUTPUT_SIZE: usize = 10; // ten digits
-const EPOCHS: usize = 2; // [ADJUSTABLE] how many times the model is trained on all the training images
-const LEARNING_RATE: f64 = 0.01; // [ADJUSTABLE] Learning rate of the model
+const EPOCHS: usize = 8; // [ADJUSTABLE] how many times the model is trained on all the training images
+const LEARNING_RATE: f64 = 0.0025; // [ADJUSTABLE] Learning rate of the model
 const BATCH_SIZE: usize = 10; // batch size for training
+const DROPOUT_RATE: f64 = 0.15; // chance that a neuron gets dropped during each batch
 
 static NUM_CPUS: Lazy<usize> = Lazy::new(|| {
 	num_cpus::get()
@@ -25,6 +26,7 @@ fn main() {
 	let _ = &*NUM_CPUS; // read lazy variable to initialize it
 
 	let mut model: Vec<Vec<Vec<f64>>> = vec![new_matrix(INPUT_FEATURES+1, HIDDEN_LAYER_SIZE, "random uniform")];
+	let no_model_dropout = vec![new_matrix(1, HIDDEN_LAYER_SIZE, "one"); HIDDEN_LAYER_COUNT]; // mask for full model
 	if HIDDEN_LAYER_COUNT > 1 {
 		for _ in 1..HIDDEN_LAYER_COUNT {
 			model.push(new_matrix(HIDDEN_LAYER_SIZE, HIDDEN_LAYER_SIZE, "random uniform"));
@@ -53,6 +55,12 @@ fn main() {
 	println!("Randomizing data order...");
 	randomize_sample_order(&mut train_imgs, &mut train_lbls);
 
+	// uncomment to save an image from the training set to disk
+	// let test_i = 12345;
+	// let test_img = train_imgs[test_i][1..].to_vec();
+	// preview_img(&test_img);
+	// println!("Training image {} has label {}", test_i, train_lbls[test_i]);
+
 	println!("Starting training...");
 	for e in 1..=EPOCHS {
 		println!("Starting epoch {}...", e);
@@ -65,7 +73,12 @@ fn main() {
 			for j in 1..BATCH_SIZE {
 				lbls_matrix.push(new_one_hot_label(train_lbls[i*BATCH_SIZE+j] as usize, OUTPUT_SIZE))
 			}
-			let cache = model_forward_pass(&model, &imgs_matrix);
+			let mut dropout_vectors: Vec<Vec<Vec<f64>>> = Vec::new();
+			// we don't want to touch the output layer
+			for _ in 0..HIDDEN_LAYER_COUNT {
+				dropout_vectors.push(new_matrix(BATCH_SIZE, HIDDEN_LAYER_SIZE, "Bernoulli"));
+			}
+			let cache = model_forward_pass(&model, &dropout_vectors, &imgs_matrix);
 			// check correctness
 			for j in 0..BATCH_SIZE {
 				let mut largest: f64 = 0.;
@@ -81,8 +94,8 @@ fn main() {
 				}
 			}
 			//do backprop pass
-			model_backprop_pass(&mut model, &cache, &lbls_matrix);
-			if start_inst.elapsed().as_secs() >= 2 {
+			model_backprop_pass(&mut model, &dropout_vectors, &cache, &lbls_matrix);
+			if i % 10 == 0 && start_inst.elapsed().as_secs() >= 2 {
 				println!("Trained on {} out of {} batches so far", i, train_imgs.len() / BATCH_SIZE);
 				start_inst = Instant::now();
 			}
@@ -93,7 +106,7 @@ fn main() {
 		// validate the model
 		correct_count = 0;
 		for i in 0..test_imgs.len() {
-			let cache = model_forward_pass(&model, &vec![test_imgs[i].clone()]);
+			let cache = model_forward_pass(&model, &no_model_dropout, &vec![test_imgs[i].clone()]);
 			let softmax = &cache[cache.len()-1];
 			// find the best guess
 			let mut best_guess_i = 0;
@@ -167,9 +180,13 @@ fn new_matrix(rows: usize, cols: usize, initialization_method: &str) -> Vec<Vec<
 	if rows == 0 || cols == 0 {
 		panic!("New matrix has zero rows or columns");
 	}
+
 	if initialization_method == "zero" {
 		return vec![vec![0.; cols]; rows];
+	} else if initialization_method == "one" {
+		return vec![vec![1.; cols]; rows];
 	}
+
 	let mut rng = rand::rng();
 	let mut matrix: Vec<Vec<f64>> = Vec::new();
 	for i in 0..rows {
@@ -178,6 +195,14 @@ fn new_matrix(rows: usize, cols: usize, initialization_method: &str) -> Vec<Vec<
 			if initialization_method == "random uniform" {
 				// uniform distribution between -1 and 1
 				matrix[i].push(2. * rng.random::<f64>() - 1.);
+			} else if initialization_method == "Bernoulli" {
+				let random = rng.random::<f64>();
+				if random < DROPOUT_RATE {
+					matrix[i].push(0.);
+				} else {
+					// use  1 / (1-p) instead of 1 since we're using inverse dropout
+					matrix[i].push(1. / (1. - DROPOUT_RATE));
+				}
 			} else {
 				panic!("Unknown initialization method {}", initialization_method);
 			}
@@ -425,14 +450,23 @@ fn new_one_hot_label(position: usize, total_size: usize) -> Vec<f64> {
 	vector
 }
 
-fn model_forward_pass(model: &Vec<Vec<Vec<f64>>>, input_sample: &Vec<Vec<f64>>) -> Vec<Vec<Vec<f64>>> {
+fn model_forward_pass(model: &Vec<Vec<Vec<f64>>>,
+	dropout_vectors: &Vec<Vec<Vec<f64>>>,
+	input_sample: &Vec<Vec<f64>>) -> Vec<Vec<Vec<f64>>> {
 	let mut intermediate_steps = vec![input_sample.to_owned(); model.len()+1];
 	for i in 0..model.len() {
-		// doing this operation: s(R*W)
-		// where s is the element-wise sigmoid, R is the output from the previous layer, and W is layer-to-layer weights
+		// doing this operation: (s(R*W)) * d
+		// where s is the element-wise sigmoid, R is the output from the previous layer, W is layer-to-layer weights
+		// and d is the dropout vector
 		intermediate_steps[i+1] = sigmoid_of_matrix(
 			&matrix_multiply(&intermediate_steps[i], &model[i]),
 		);
+
+		// do dropout on all the outputs except for the final one
+		if i < model.len() - 1 {
+			// do element-wise multiplication of the output of this layer with the dropout vector
+			intermediate_steps[i+1] = matrix_hadamard(&dropout_vectors[i], &intermediate_steps[i+1])
+		}
 	}
 	// perform softmax on the last step to get probabilities
 	intermediate_steps.push(softmax_of_matrix(&intermediate_steps[intermediate_steps.len()-1]));
@@ -440,6 +474,7 @@ fn model_forward_pass(model: &Vec<Vec<Vec<f64>>>, input_sample: &Vec<Vec<f64>>) 
 }
 
 fn model_backprop_pass(model: &mut Vec<Vec<Vec<f64>>>,
+	dropout_vectors: &Vec<Vec<Vec<f64>>>,
 	intermediate_steps: &Vec<Vec<Vec<f64>>>,
 	sample_label: &Vec<Vec<f64>>) {
 	// how much to change the weights
@@ -458,6 +493,7 @@ fn model_backprop_pass(model: &mut Vec<Vec<Vec<f64>>>,
 		let i1 = model.len() - i;
 		// 2nd index, for the previous layer activation in `intermediate_steps`
 		let i2 = intermediate_steps.len() - i - 2;
+
 		model[i1] = matrix_subtract(
 			&model[i1],
 			&matrix_scalar_mult(
@@ -468,12 +504,15 @@ fn model_backprop_pass(model: &mut Vec<Vec<Vec<f64>>>,
 				)
 			)
 		);
-		delta_t = matrix_hadamard(
-			&sigmoid_prime_of_matrix(&intermediate_steps[i2]),
-			&matrix_multiply(
-				&delta_t,
-				&matrix_transpose(&model[i1])
-			)
-		);
+
+		if i1 > 0 {
+			delta_t = matrix_hadamard(&matrix_hadamard(
+				&sigmoid_prime_of_matrix(&intermediate_steps[i2]),
+				&matrix_multiply(
+					&delta_t,
+					&matrix_transpose(&model[i1])
+				)
+			), &dropout_vectors[i1 - 1]);
+		}
 	}
 }
