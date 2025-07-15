@@ -7,12 +7,12 @@ use once_cell::sync::Lazy;
 
 const INPUT_FEATURES: usize = 28 * 28; // 28x28 images
 const HIDDEN_LAYER_COUNT: usize = 1; // [ADJUSTABLE] total amount of hidden layers
-const HIDDEN_LAYER_SIZE: usize = 200; // [ADJUSTABLE] perceptrons per each hidden layer
+const HIDDEN_LAYER_SIZE: usize = 300; // [ADJUSTABLE] perceptrons per each hidden layer
 const OUTPUT_SIZE: usize = 10; // ten digits
 const EPOCHS: usize = 6; // [ADJUSTABLE] how many times the model is trained on all the training images
-const LEARNING_RATE: f64 = 0.0025; // [ADJUSTABLE] Learning rate of the model
+const LEARNING_RATE: f64 = 0.005; // [ADJUSTABLE] Learning rate of the model
 const BATCH_SIZE: usize = 10; // batch size for training
-const DROPOUT_RATE: f64 = 0.15; // chance that a neuron gets dropped during each batch
+const DROPOUT_RATE: f64 = 0.25; // chance that a neuron gets dropped during each batch
 
 static NUM_CPUS: Lazy<usize> = Lazy::new(|| {
 	num_cpus::get()
@@ -68,19 +68,23 @@ fn main() {
 		let mut correct_count: usize = 0;
 		let mut start_inst = Instant::now();
 		for i in 0..(train_imgs.len() / BATCH_SIZE) {
-			let imgs_matrix = &train_imgs[i*BATCH_SIZE..((i+1)*BATCH_SIZE)].to_owned();
+			// generate images and labels matrices
+			let mut imgs_matrix = train_imgs[i*BATCH_SIZE..((i+1)*BATCH_SIZE)].to_owned();
 			let mut lbls_matrix: Vec<Vec<f64>> = vec![new_one_hot_label(train_lbls[i*BATCH_SIZE] as usize, OUTPUT_SIZE)];
 			for j in 1..BATCH_SIZE {
 				lbls_matrix.push(new_one_hot_label(train_lbls[i*BATCH_SIZE+j] as usize, OUTPUT_SIZE))
 			}
+
+			// generate dropout vectors
 			let mut dropout_vectors: Vec<Vec<Vec<f64>>> = Vec::new();
 			// we don't want to touch the output layer
 			for _ in 0..HIDDEN_LAYER_COUNT {
 				dropout_vectors.push(new_matrix(BATCH_SIZE, HIDDEN_LAYER_SIZE, "Bernoulli"));
 			}
+
+			// do forward pass and check correctness
 			let cache = model_forward_pass(&model, &dropout_vectors, &imgs_matrix);
-			// check correctness
-			for j in 0..BATCH_SIZE {
+			for j in (0..BATCH_SIZE).rev() {
 				let mut largest: f64 = 0.;
 				let mut largest_i: usize = 0;
 				for k in 0..cache[cache.len()-1].len() {
@@ -91,10 +95,22 @@ fn main() {
 				}
 				if largest_i == train_lbls[i*BATCH_SIZE+j] as usize {
 					correct_count += 1;
+					lbls_matrix.remove(j);
+					imgs_matrix.remove(j);
+					for k in 0..dropout_vectors.len() {
+						dropout_vectors[k].remove(j);
+					}
 				}
 			}
-			//do backprop pass
-			model_backprop_pass(&mut model, &dropout_vectors, &cache, &lbls_matrix);
+
+			if imgs_matrix.len() > 0 {
+				// do the forward pass again with images the model identified wrongly
+				let cache = model_forward_pass(&model, &dropout_vectors, &imgs_matrix);
+
+				//do backprop pass
+				model_backprop_pass(&mut model, &dropout_vectors, &cache, &lbls_matrix);
+			}
+
 			if i % 10 == 0 && start_inst.elapsed().as_secs() >= 2 {
 				println!("Trained on {} out of {} batches so far", i, train_imgs.len() / BATCH_SIZE);
 				start_inst = Instant::now();
@@ -477,6 +493,8 @@ fn model_backprop_pass(model: &mut Vec<Vec<Vec<f64>>>,
 	dropout_vectors: &Vec<Vec<Vec<f64>>>,
 	intermediate_steps: &Vec<Vec<Vec<f64>>>,
 	sample_label: &Vec<Vec<f64>>) {
+	// batch size can be taken from the amount of rows of the input
+	let batch_size = intermediate_steps[0].len();
 	// how much to change the weights
 	// calculation is: (O^T - L) * s'(H)
 	// where O is the output matrix (w/ softmax), L is the sample label, s' is sigmoid prime, and H is the last hidden layer output
@@ -497,7 +515,7 @@ fn model_backprop_pass(model: &mut Vec<Vec<Vec<f64>>>,
 		model[i1] = matrix_subtract(
 			&model[i1],
 			&matrix_scalar_mult(
-				&(LEARNING_RATE / BATCH_SIZE as f64),
+				&(LEARNING_RATE / batch_size as f64),
 				&matrix_multiply(
 					&matrix_transpose(&intermediate_steps[i2]),
 					&delta_t
