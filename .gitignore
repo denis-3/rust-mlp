@@ -1,3 +1,6 @@
 /data
 /target
 Cargo.lock
+/model-weights.bin
+/img-preview.png
+/test-image.png

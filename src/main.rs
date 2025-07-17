@@ -3,27 +3,35 @@ use rand::Rng;
 use std::time::{Instant};
 use image::{GrayImage, Luma};
 use std::sync::{Arc, Mutex};
-use once_cell::sync::Lazy;
+use std::fs::File;
+use std::io::Write;
+use std::io::BufWriter;
+use std::io::Read;
 
+// Do not adjust these parameters unless you aren't using the MNIST data
 const INPUT_FEATURES: usize = 28 * 28; // 28x28 images
-const HIDDEN_LAYER_COUNT: usize = 1; // [ADJUSTABLE] total amount of hidden layers
-const HIDDEN_LAYER_SIZE: usize = 300; // [ADJUSTABLE] perceptrons per each hidden layer
 const OUTPUT_SIZE: usize = 10; // ten digits
-const EPOCHS: usize = 6; // [ADJUSTABLE] how many times the model is trained on all the training images
-const LEARNING_RATE: f64 = 0.005; // [ADJUSTABLE] Learning rate of the model
-const BATCH_SIZE: usize = 10; // batch size for training
-const DROPOUT_RATE: f64 = 0.25; // chance that a neuron gets dropped during each batch
 
-static NUM_CPUS: Lazy<usize> = Lazy::new(|| {
-	num_cpus::get()
-});
+// These parameters are adjustable
+const LOAD_MODEL_FROM_FILE: bool = false; // set it to false to train from scratch
+const SAVE_MODEL_TO_FILE: bool = true; // set it to true to save the weights to model-weights.bin
+const EPOCHS: usize = 10; // how many times the model is trained on all the training images
+const HIDDEN_LAYER_COUNT: usize = 2; // total amount of hidden layers
+const HIDDEN_LAYER_SIZE: usize = 300; // perceptrons per each hidden layer
+const LEARNING_RATE: f64 = 7e-3; // Learning rate of the model
+const DROPOUT_RATE: f64 = 0.25; // chance that a neuron gets dropped during each batch
+const BATCH_SIZE: usize = 10; // batch size for training
+const LEAKY_RELU_SLOPE: f64 = 0.01; // slope of the leaky ReLU function for x < 0
+const PARALLEL_THREAD_CT: usize = 16; // how many threads are used in parallel to increase computation speed for some functions
 
 fn main() {
 	if HIDDEN_LAYER_COUNT == 0 {
 		panic!("There must be at least one hidden layer!");
 	}
 
-	let _ = &*NUM_CPUS; // read lazy variable to initialize it
+	let cpu_count = num_cpus::get();
+
+	println!("Detected {} logical CPUs on this machine. Using {} threads for parallelization", cpu_count, PARALLEL_THREAD_CT);
 
 	let mut model: Vec<Vec<Vec<f64>>> = vec![new_matrix(INPUT_FEATURES+1, HIDDEN_LAYER_SIZE, "random uniform")];
 	let no_model_dropout = vec![new_matrix(1, HIDDEN_LAYER_SIZE, "one"); HIDDEN_LAYER_COUNT]; // mask for full model
@@ -34,6 +42,43 @@ fn main() {
 	}
 
 	model.push(new_matrix(HIDDEN_LAYER_SIZE, OUTPUT_SIZE, "random uniform"));
+
+	if LOAD_MODEL_FROM_FILE {
+		// first load model weights
+		println!("Loading model from file...");
+		let mut file = File::open("model-weights.bin").expect("Could not open file! Maybe it does not exist");
+		for i in 0..model.len() {
+			for j in 0..model[i].len() {
+				for k in 0..model[i][j].len() {
+					// an f64 is 8 bytes
+					let mut this_float_le = [0; 8];
+					let count = file.read(&mut this_float_le).expect("Could not read file");
+					if count < 8 {
+						panic!("Could not read full 8 bytes! Most likely the current model parameters are different than the ones which were used in the creation of the model-weights.bin file");
+					}
+					model[i][j][k] = f64::from_le_bytes(this_float_le);
+				}
+			}
+		}
+
+		println!("Loading image...");
+
+		// then evaluate on a test image
+		let grey_img = image::open("test-image.png")
+			.expect("Could not open image file. Most likely it does not exist")
+			.into_luma8();
+
+		let mut image_vec: Vec<f64> = vec![1.];
+		for i in 0..INPUT_FEATURES {
+			let p = grey_img.get_pixel((i % 28) as u32, (i / 28) as u32);
+			image_vec.push(p[0] as f64 / 255.);
+		}
+
+		let prediction = get_model_predictions(&model, &no_model_dropout, &vec![image_vec]);
+		println!("The model's prediction is: {}", prediction[0]);
+
+		return
+	}
 
 	println!("Loading training images...");
 	let mut train_imgs = load_mnist_images_file("./data/train-images-idx3-ubyte");
@@ -83,17 +128,9 @@ fn main() {
 			}
 
 			// do forward pass and check correctness
-			let cache = model_forward_pass(&model, &dropout_vectors, &imgs_matrix);
+			let predictions = get_model_predictions(&model, &dropout_vectors, &imgs_matrix);
 			for j in (0..BATCH_SIZE).rev() {
-				let mut largest: f64 = 0.;
-				let mut largest_i: usize = 0;
-				for k in 0..cache[cache.len()-1].len() {
-					if cache[cache.len()-1][j][k] > largest {
-						largest = cache[cache.len()-1][j][k];
-						largest_i = k
-					}
-				}
-				if largest_i == train_lbls[i*BATCH_SIZE+j] as usize {
+				if predictions[j] == train_lbls[i*BATCH_SIZE+j] as usize {
 					correct_count += 1;
 					lbls_matrix.remove(j);
 					imgs_matrix.remove(j);
@@ -122,24 +159,26 @@ fn main() {
 		// validate the model
 		correct_count = 0;
 		for i in 0..test_imgs.len() {
-			let cache = model_forward_pass(&model, &no_model_dropout, &vec![test_imgs[i].clone()]);
-			let softmax = &cache[cache.len()-1];
-			// find the best guess
-			let mut best_guess_i = 0;
-			let mut best_pct: f64 = 0.;
-			for j in 0..OUTPUT_SIZE {
-				if softmax[0][j] > best_pct {
-					best_pct = softmax[0][j];
-					best_guess_i = j;
-				}
-			}
-
-			if best_guess_i == test_lbls[i] as usize {
+			if get_model_predictions(&model, &no_model_dropout, &vec![test_imgs[i].clone()])[0] == test_lbls[i] as usize {
 				correct_count += 1;
 			}
 		}
 		println!("Validation accuracy: {} out of {}", correct_count, test_imgs.len());
 		println!("");
+	}
+
+	if !SAVE_MODEL_TO_FILE { return };
+
+	// save model weights
+	println!("Saving model weights...");
+	let file = File::create("model-weights.bin").expect("Failed to create file to store model weights");
+	let mut file = BufWriter::new(file);
+	for i in 0..model.len() {
+		for j in 0..model[i].len() {
+			for k in 0..model[i][j].len() {
+				file.write(&model[i][j][k].to_le_bytes()).expect("Could not write to file");
+			}
+		}
 	}
 }
 
@@ -259,8 +298,7 @@ fn matrix_subtract(mat_a: &Vec<Vec<f64>>, mat_b: &Vec<Vec<f64>>) -> Vec<Vec<f64>
 	let mat_a_arc = Arc::new(mat_a.clone());
 	let mat_b_arc = Arc::new(mat_b.clone());
 
-	let cpu_count = Lazy::get(&NUM_CPUS).unwrap();
-	let thread_count = if cpu_count > &ra { ra } else { *cpu_count };
+	let thread_count = if PARALLEL_THREAD_CT > ra { ra } else { PARALLEL_THREAD_CT };
 	let result: Arc<Mutex<Vec<Vec<Vec<f64>>>>> = Arc::new(Mutex::new(vec![Vec::new(); thread_count]));
 	let mut handles = Vec::new();
 
@@ -309,8 +347,7 @@ fn matrix_multiply(mat_a: &Vec<Vec<f64>>, mat_b: &Vec<Vec<f64>>) -> Vec<Vec<f64>
 	let mat_a_arc = Arc::new(mat_a.clone());
 	let mat_b_arc = Arc::new(mat_b.clone());
 
-	let cpu_count = Lazy::get(&NUM_CPUS).unwrap();
-	let thread_count = if cpu_count > &ra { ra } else { *cpu_count };
+	let thread_count = if PARALLEL_THREAD_CT > ra { ra } else { PARALLEL_THREAD_CT };
 	let prod: Arc<Mutex<Vec<Vec<Vec<f64>>>>> = Arc::new(Mutex::new(vec![Vec::new(); thread_count]));
 	let mut handles = Vec::new();
 
@@ -380,60 +417,31 @@ fn matrix_hadamard(mat_a: &Vec<Vec<f64>>, mat_b: &Vec<Vec<f64>>) -> Vec<Vec<f64>
 
 	result
 }
-// sigmoid (or logistic) function element-wise on a matrix
-fn sigmoid_of_matrix(matrix: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {
-	// define Arc matrix for use with parallelization
-	let r = matrix.len();
-	let c = matrix[0].len();
-	let mat_arc = Arc::new(matrix.clone());
-
-	let cpu_count = Lazy::get(&NUM_CPUS).unwrap();
-	let thread_count = if cpu_count > &r { r } else { *cpu_count };
-	let result: Arc<Mutex<Vec<Vec<f64>>>> = Arc::new(Mutex::new(new_matrix(matrix.len(), matrix[0].len(), "zero")));
-	let mut handles = Vec::new();
-
-	for i in 0..thread_count {
-		let mat1 = Arc::clone(&mat_arc);
-		let result = Arc::clone(&result);
-		let start_row = ((r as f64) / (thread_count as f64) * (i as f64)).floor() as usize;
-		let end_row = ((r as f64) / (thread_count as f64) * ((i+1) as f64)).floor() as usize;
-		let handle = thread::spawn(move || {
-			let mut partial_result = new_matrix(end_row - start_row, c, "zero");
-			// calculate results first
-			// row iterator
-			for j in start_row..end_row {
-				// col iterator
-				for k in 0..c {
-					partial_result[j - start_row][k] = 1. / (1. + std::f64::consts::E.powf(-mat1[j][k]));
-				}
-			}
-
-			// transfer results
-			let mut result_locked = result.lock().unwrap();
-			for j in start_row..end_row {
-				for k in 0..c {
-					result_locked[j][k] = partial_result[j - start_row][k]
-				}
-			}
-		});
-
-		handles.push(handle);
-	}
-
-	for handle in handles {
-		handle.join().unwrap();
-	}
-
-	result.lock().unwrap().to_vec()
-}
-
-// derivative of sigmoid
-fn sigmoid_prime_of_matrix(matrix: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+// leaky ReLU function: x for x >= 0 and 0.01x for x < 0
+fn relu_of_matrix(matrix: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {
 	let mut result = new_matrix(matrix.len(), matrix[0].len(), "zero");
 	for i in 0..(matrix.len()) {
 		for j in 0..(matrix[0].len()) {
-			let s = 1. / (1. + std::f64::consts::E.powf(-matrix[i][j]));
-			result[i][j] = s * (1. - s);
+			if matrix[i][j] >= 0. {
+				result[i][j] = matrix[i][j];
+			} else {
+				result[i][j] = matrix[i][j] * LEAKY_RELU_SLOPE;
+			}
+		}
+	}
+	result
+}
+
+// derivative of the leaky ReLU
+fn relu_prime_of_matrix(matrix: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+	let mut result = new_matrix(matrix.len(), matrix[0].len(), "zero");
+	for i in 0..(matrix.len()) {
+		for j in 0..(matrix[0].len()) {
+			if matrix[i][j] >= 0. {
+				result[i][j] = 1.;
+			} else {
+				result[i][j] = LEAKY_RELU_SLOPE;
+			}
 		}
 	}
 	result
@@ -446,14 +454,32 @@ fn softmax_of_matrix(matrix: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {
 
 	let mut softmax = new_matrix(r, c, "zero");
 
+	// subtract the largest value of each row from its elements
 	for i in 0..r {
-		let mut exp_sum: f64 = 0.;
+		// find largest value
+		let mut largest: f64 = 0.;
 		for j in 0..c {
-			exp_sum += std::f64::consts::E.powf(matrix[i][j]);
+			if matrix[i][j] > largest || largest == 0. {
+				largest = matrix[i][j];
+			}
 		}
 
+		// subtract it
 		for j in 0..c {
-			softmax[i][j] = std::f64::consts::E.powf(matrix[i][j]) / exp_sum;
+			softmax[i][j] = matrix[i][j] - largest;
+		}
+	}
+
+	for i in 0..r {
+		// get sum of exp's
+		let mut exp_sum: f64 = 0.;
+		for j in 0..c {
+			exp_sum += std::f64::consts::E.powf(softmax[i][j]);
+		}
+
+		// calculate softmax per-element
+		for j in 0..c {
+			softmax[i][j] = std::f64::consts::E.powf(softmax[i][j]) / exp_sum;
 		}
 	}
 
@@ -474,7 +500,7 @@ fn model_forward_pass(model: &Vec<Vec<Vec<f64>>>,
 		// doing this operation: (s(R*W)) * d
 		// where s is the element-wise sigmoid, R is the output from the previous layer, W is layer-to-layer weights
 		// and d is the dropout vector
-		intermediate_steps[i+1] = sigmoid_of_matrix(
+		intermediate_steps[i+1] = relu_of_matrix(
 			&matrix_multiply(&intermediate_steps[i], &model[i]),
 		);
 
@@ -487,6 +513,34 @@ fn model_forward_pass(model: &Vec<Vec<Vec<f64>>>,
 	// perform softmax on the last step to get probabilities
 	intermediate_steps.push(softmax_of_matrix(&intermediate_steps[intermediate_steps.len()-1]));
 	intermediate_steps
+}
+
+// convenience function to do a forward pass and get the model's prediction
+// returns a vector with the prediction of the model for each input row
+fn get_model_predictions(model: &Vec<Vec<Vec<f64>>>,
+	dropout_vectors: &Vec<Vec<Vec<f64>>>,
+	input_sample: &Vec<Vec<f64>>) -> Vec<usize> {
+	let cache = model_forward_pass(model, dropout_vectors, input_sample);
+	let softmax = &cache[cache.len()-1];
+	let mut output: Vec<usize> = Vec::new();
+
+	for i in 0..softmax.len() {
+		// find the best guess
+		let mut best_guess_i = 0;
+		let mut best_pct: f64 = 0.;
+		for j in 0..softmax[i].len() {
+			let p = softmax[i][j];
+			if !p.is_finite() {
+				panic!("Encountered a NaN or infinite value! Please decrease the learning rate");
+			}
+			if p > best_pct {
+				best_pct = p;
+				best_guess_i = j;
+			}
+		}
+		output.push(best_guess_i)
+	}
+	return output;
 }
 
 fn model_backprop_pass(model: &mut Vec<Vec<Vec<f64>>>,
@@ -503,7 +557,7 @@ fn model_backprop_pass(model: &mut Vec<Vec<Vec<f64>>>,
 			&intermediate_steps[intermediate_steps.len()-1],
 			sample_label
 		),
-		&sigmoid_prime_of_matrix(&intermediate_steps[intermediate_steps.len()-2])
+		&relu_prime_of_matrix(&intermediate_steps[intermediate_steps.len()-2])
 	);
 
 	for i in 1..=model.len() {
@@ -525,7 +579,7 @@ fn model_backprop_pass(model: &mut Vec<Vec<Vec<f64>>>,
 
 		if i1 > 0 {
 			delta_t = matrix_hadamard(&matrix_hadamard(
-				&sigmoid_prime_of_matrix(&intermediate_steps[i2]),
+				&relu_prime_of_matrix(&intermediate_steps[i2]),
 				&matrix_multiply(
 					&delta_t,
 					&matrix_transpose(&model[i1])
